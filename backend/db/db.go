@@ -3,28 +3,50 @@ package db
 import (
 	"auth-service/model"
 	"database/sql"
+	"fmt"
+	"os"
+	"time"
 
 	_ "github.com/lib/pq"
-	"golang.org/x/crypto/bcrypt"
 )
 
 type DB struct {
 	*sql.DB
 }
 
-func NewDB() (*DB, error) {
-	connStr := "host=db port=5432 user=postgres password=postgres dbname=postgres sslmode=disable"
-	db, err := sql.Open("postgres", connStr)
-	if err != nil {
-		return nil, err
+func getEnv(key, fallback string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
 	}
+	return v
+}
 
-	err = db.Ping()
-	if err != nil {
-		db.Close()
-		return nil, err
+func NewDB() (*DB, error) {
+	host := getEnv("DB_HOST", "db")
+	port := getEnv("DB_PORT", "5432")
+	dbname := getEnv("DB_NAME", "postgres")
+	password := getEnv("DB_PASSWORD", "postgres")
+	user := getEnv("DB_USER", "postgres")
+
+	connStr := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable", host, port, user, password, dbname)
+
+	var lastErr error
+	for i := 0; i < 10; i++ {
+		conn, err := sql.Open("postgres", connStr)
+		if err != nil {
+			lastErr = err
+		} else {
+			err = conn.Ping()
+			if err == nil {
+				return &DB{conn}, nil
+			}
+			lastErr = err
+			conn.Close()
+		}
+		time.Sleep(1 * time.Second)
 	}
-	return &DB{db}, nil
+	return nil, lastErr
 }
 
 func (db *DB) InitDB() error {
@@ -47,18 +69,12 @@ func (db *DB) InitDB() error {
 }
 
 func (db *DB) AddUser(user *model.User) error {
-	//hashing/encrypting password
-	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(user.Password), bcrypt.DefaultCost)
-	if err != nil {
-		return err
-	}
-	user.Password = string(hashedPassword)
-
 	query := `
-	INSERT INTO users (user_id, email, password, first_name, last_name, created_at, updated_at)
-	VALUES ($1, $2, $3, $4, $5, $6, $7)
+	INSERT INTO users (email, password, first_name, last_name)
+	VALUES ($1, $2, $3, $4)
+	RETURNING user_id, created_at, updated_at
 	`
-	_, err = db.Exec(query, user.User_ID, user.Email, user.Password, user.First_Name, user.Last_Name, user.Created_At, user.Updated_At)
+	err := db.QueryRow(query, user.Email, user.Password, user.First_Name, user.Last_Name).Scan(&user.User_ID, &user.Created_At, &user.Updated_At)
 	if err != nil {
 		return err
 	}
@@ -68,10 +84,10 @@ func (db *DB) AddUser(user *model.User) error {
 func (db *DB) UpdateUser(user *model.User) error {
 	query := `
 	UPDATE users
-	SET email = $1, password = $2, first_name = $3, last_name = $4, updated_at = $5
-	WHERE user_id = $6
+	SET email = $1, password = $2, first_name = $3, last_name = $4, updated_at = CURRENT_TIMESTAMP
+	WHERE user_id = $5
 	`
-	_, err := db.Exec(query, user.Email, user.Password, user.First_Name, user.Last_Name, user.Updated_At, user.User_ID)
+	_, err := db.Exec(query, user.Email, user.Password, user.First_Name, user.Last_Name, user.User_ID)
 	if err != nil {
 		return err
 	}

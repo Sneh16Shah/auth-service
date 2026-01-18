@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
-	"net/http"
 	"log"
+	"net/http"
+	"net/mail"
 	"os"
+	"strings"
+	"time"
 
 	dbpkg "auth-service/db"
 	"auth-service/model"
@@ -14,160 +16,263 @@ import (
 	"golang.org/x/crypto/bcrypt"
 )
 
+type registerRequest struct {
+	Email     string `json:"email"`
+	Password  string `json:"password"`
+	FirstName string `json:"first_name"`
+	LastName  string `json:"last_name"`
+}
+
+type loginRequest struct {
+	Email    string `json:"email"`
+	Password string `json:"password"`
+}
+
+type apiResponse struct {
+	Message string `json:"message"`
+	Token   string `json:"token,omitempty"`
+}
+
+func writeJSON(w http.ResponseWriter, status int, payload apiResponse) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(payload)
+}
+
+func writeCORSHeaders(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+	w.Header().Set("Access-Control-Allow-Headers", "Content-Type, Authorization")
+}
+
+func enforcePost(w http.ResponseWriter, r *http.Request) bool {
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return false
+	}
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Method not allowed"})
+		return false
+	}
+	return true
+}
+
+func normalizeEmail(email string) string {
+	return strings.ToLower(strings.TrimSpace(email))
+}
+
+func validateEmail(email string) bool {
+	_, err := mail.ParseAddress(email)
+	return err == nil
+}
+
 func healthCheckHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Healthy"))
+	writeCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, apiResponse{Message: "Healthy"})
 }
 
 func serverHandler(w http.ResponseWriter, r *http.Request) {
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Hello welcome to my server!"))
+	writeCORSHeaders(w)
+	if r.Method == http.MethodOptions {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeJSON(w, http.StatusMethodNotAllowed, apiResponse{Message: "Method not allowed"})
+		return
+	}
+	writeJSON(w, http.StatusOK, apiResponse{Message: "Hello welcome to my server!"})
 }
 
 func registerHandler(w http.ResponseWriter, r *http.Request, db *dbpkg.DB) {
-	// enable cors
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-
-	var user *model.User
-	err := json.NewDecoder(r.Body).Decode(&user)
-	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("Invalid request payload"))
+	writeCORSHeaders(w)
+	if !enforcePost(w, r) {
 		return
 	}
-	// validate if user already exist or not
-	userExist, err := db.GetUser(user.Email)
+
+	var req registerRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
-		fmt.Println("GetUser error:", err)
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Error checking user existence"))
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request payload"})
+		return
+	}
+
+	req.Email = normalizeEmail(req.Email)
+	if req.Email == "" || !validateEmail(req.Email) {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid email"})
+		return
+	}
+
+	if len(req.Password) < 8 {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Password must be at least 8 characters"})
+		return
+	}
+	if len(req.Password) > 72 {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Password too long"})
+		return
+	}
+
+	req.FirstName = strings.TrimSpace(req.FirstName)
+	req.LastName = strings.TrimSpace(req.LastName)
+
+	// validate if user already exist or not
+	userExist, err := db.GetUser(req.Email)
+	if err != nil {
+		log.Println("GetUser error:", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Error checking user existence"})
 		return
 	}
 	if userExist != nil {
-		w.WriteHeader(http.StatusConflict)
-		w.Write([]byte("User already exist"))
+		writeJSON(w, http.StatusConflict, apiResponse{Message: "User already exist"})
 		return
 	}
 
-	if user.First_Name == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("First name is required"))
+	if req.FirstName == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "First name is required"})
 		return
 	}
 
-	if user.Last_Name == "" {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("Last name is required"))
+	if req.LastName == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Last name is required"})
 		return
 	}
 
-	// add user to db
-	newUser := model.NewUser(user.Email, user.Password, user.First_Name, user.Last_Name)
+	hashedPassword, err := bcrypt.GenerateFromPassword([]byte(req.Password), bcrypt.DefaultCost)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Error creating user"})
+		return
+	}
+
+	newUser := model.NewUser(req.Email, string(hashedPassword), req.FirstName, req.LastName)
 
 	err = db.AddUser(newUser)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Error adding user to database"))
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Error adding user to database"})
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Registered Successfully"))
+	writeJSON(w, http.StatusOK, apiResponse{Message: "Registered Successfully"})
 }
 
 func loginHandler(w http.ResponseWriter, r *http.Request, db *dbpkg.DB) {
-	// enable cors
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
-	// get email, paswword
-	var loginReq struct {
-		Email    string `json:"email"`
-		Password string `json:"password"`
+	writeCORSHeaders(w)
+	if !enforcePost(w, r) {
+		return
 	}
 
-	err := json.NewDecoder(r.Body).Decode(&loginReq)
+	var req loginRequest
+	err := json.NewDecoder(r.Body).Decode(&req)
 	if err != nil {
-		w.WriteHeader(http.StatusBadRequest)
-		w.Write([]byte("Invalid request payload"))
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid request payload"})
+		return
+	}
+
+	req.Email = normalizeEmail(req.Email)
+	if req.Email == "" || !validateEmail(req.Email) {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Invalid email"})
+		return
+	}
+	if req.Password == "" {
+		writeJSON(w, http.StatusBadRequest, apiResponse{Message: "Password is required"})
 		return
 	}
 
 	// get user from db
-	user, err := db.GetUser(loginReq.Email)
+	user, err := db.GetUser(req.Email)
 	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("Invalid email or password"))
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Invalid email or password"})
+		return
+	}
+	if user == nil {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Invalid email or password"})
 		return
 	}
 
-	if err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(loginReq.Password)); err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("Invalid email or password"))
+	if err = bcrypt.CompareHashAndPassword([]byte(user.Password), []byte(req.Password)); err != nil {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Invalid email or password"})
 		return
 	}
 
 	token, err := utils.GetTokenizer(uint(user.User_ID), user.Email)
 	if err != nil {
-		w.WriteHeader(http.StatusInternalServerError)
-		w.Write([]byte("Error generating token"))
+		log.Println("Error generating token:", err)
+		writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Error generating token"})
 		return
 	}
-	log.Println(token)
 
-	// return user
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Logged in"))
+	writeJSON(w, http.StatusOK, apiResponse{Message: "Logged in", Token: token})
 }
 
 func checkValidToken(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Access-Control-Allow-Origin", "*")
-	w.Header().Set("Access-Control-Allow-Methods", "POST")
-	w.Header().Set("Access-Control-Allow-Headers", "Content-Type")
+	writeCORSHeaders(w)
+	if !enforcePost(w, r) {
+		return
+	}
+
+	//validate header existis
+	if _, ok := r.Header["Authorization"]; !ok {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Missing token"})
+		return
+	}
 
 	tokenString := r.Header.Get("Authorization")
 	if tokenString == "" {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("Missing token"))
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Missing token"})
+		return
+	}
+
+	if !strings.HasPrefix(tokenString, "Bearer ") {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Invalid token format"})
 		return
 	}
 
 	tokenString = tokenString[7:]
-
-	err := utils.ValidateToken(tokenString)
-	if err != nil {
-		w.WriteHeader(http.StatusUnauthorized)
-		w.Write([]byte("Invalid token"))
+	if tokenString == "" {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Invalid token format"})
 		return
 	}
 
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte("Valid token"))
+	err := utils.ValidateToken(tokenString)
+	if err != nil {
+		writeJSON(w, http.StatusUnauthorized, apiResponse{Message: "Invalid token"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, apiResponse{Message: "Valid token"})
 }
 
 func main() {
-	fmt.Println("Hello, World!")
-	// listen to port 8080
+	log.Println("Starting auth-service...")
 	http.HandleFunc("/", serverHandler)
 	http.HandleFunc("/health", healthCheckHandler)
 
 	db, err := dbpkg.NewDB()
 	if err != nil {
-		fmt.Println("Database connection error temporarily unavailable:", err)
+		log.Println("Database connection error temporarily unavailable:", err)
 	}
 	if db != nil {
 		err = db.InitDB()
 		if err != nil {
-			fmt.Println("Database initialization error:", err)
+			log.Println("Database initialization error:", err)
 		}
 	}
 
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("Database not available"))
+			writeCORSHeaders(w)
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Database not available"})
 			return
 		}
 		registerHandler(w, r, db)
@@ -175,8 +280,12 @@ func main() {
 
 	http.HandleFunc("/login", func(w http.ResponseWriter, r *http.Request) {
 		if db == nil {
-			w.WriteHeader(http.StatusInternalServerError)
-			w.Write([]byte("Database not available"))
+			writeCORSHeaders(w)
+			if r.Method == http.MethodOptions {
+				w.WriteHeader(http.StatusNoContent)
+				return
+			}
+			writeJSON(w, http.StatusInternalServerError, apiResponse{Message: "Database not available"})
 			return
 		}
 		loginHandler(w, r, db)
@@ -188,8 +297,20 @@ func main() {
 	})
 
 	port := os.Getenv("PORT")
-	fmt.Println("Listening on port " + port + "...")
-	if err := http.ListenAndServe(":"+port, nil); err != nil {
-		fmt.Println("Error:", err)
+	if port == "" {
+		port = "8080"
+	}
+	log.Println("Listening on port " + port + "...")
+
+	server := &http.Server{
+		Addr:              ":" + port,
+		Handler:           http.DefaultServeMux,
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
+	}
+	if err := server.ListenAndServe(); err != nil {
+		log.Println("Error:", err)
 	}
 }

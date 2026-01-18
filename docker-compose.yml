@@ -1,20 +1,29 @@
 services:
   db:
     image: postgres:16-alpine
+    # Data is persisted in the named volume `db_data`.
+    # To reset the database locally: `docker compose down -v`
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: postgres
     ports:
       - "5432:5432"
+    volumes:
+      - db_data:/var/lib/postgresql/data
 
   backend:
     build: ./backend
     ports:
       - "8080:8080"
+    env_file:
+      - ./backend/.env
     environment:
       - PORT=8080
     depends_on:
       - db
     volumes:
       - ./backend:/app
+
+volumes:
+  db_data:
